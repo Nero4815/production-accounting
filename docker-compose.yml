@@ -1,0 +1,30 @@
+version: '3.8'
+services:
+  db:
+    image: postgres:15
+    restart: always
+    environment:
+      POSTGRES_DB: production_db
+      POSTGRES_USER: nero
+      POSTGRES_PASSWORD: secure_password_123
+    volumes:
+      - pg:/var/lib/postgresql/data
+      - ./backups:/backups
+    networks:
+      - prodnet
+
+  app:
+    build: .
+    ports:
+      - "8501:8501"
+    depends_on:
+      - db
+    restart: always
+    networks:
+      - prodnet
+
+volumes:
+  pg
+
+networks:
+  prodnet:
