@@ -63,7 +63,13 @@ if uploaded_file:
             for _, row in df.iterrows():
                 full_name = str(row[name_col]).strip()
                 qty_kg = float(row[qty_col])
-                prod_date = pd.to_datetime(row[date_col]).date()
+                # Обработка даты в формате "06.11.2025:00"
+                date_str = str(row[date_col]).strip()
+                if ':' in date_str and '.' in date_str:
+                    date_part = date_str.split(':')[0]  # Берём только "06.11.2025"
+                    prod_date = pd.to_datetime(date_part, format='%d.%m.%Y').date()
+                else:
+                    prod_date = pd.to_datetime(row[date_col]).date()
 
                 cur.execute("SELECT id FROM products WHERE mercurius_name = %s", (full_name,))
                 prod = cur.fetchone()
