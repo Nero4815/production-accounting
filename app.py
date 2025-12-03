@@ -1,45 +1,25 @@
-import streamlit as st
-import pandas as pd
-import psycopg2
-from datetime import datetime, date
-import re
-
-DB_CONFIG = {
-    "host": "db",
-    "database": "production_db",
-    "user": "nero",
-    "password": "secure_password_123"
-}
-
-def get_db_connection():
-    return psycopg2.connect(**DB_CONFIG)
-
-# Простая аутентификация
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-
-if not st.session_state.authenticated:
-    with st.form("auth"):
-        pwd = st.text_input("Пароль для аудита", type="password")
-        if st.form_submit_button("Войти"):
-            if pwd == "audit2025":
-                st.session_state.authenticated = True
-                st.rerun()
-    st.stop()
-
-st.title("🐟 Система прослеживаемости производства")
-
-# === ИМПОРТ EXCEL ===
-st.subheader("Импорт выпуска из Меркурия")
-uploaded_file = st.file_uploader("Загрузите Excel-файл", type=["xlsx"])
-
 if uploaded_file:
     try:
-        df = pd.read_excel(uploaded_file, skiprows=7)
-        
-        date_col = [c for c in df.columns if 'дата выработки' in str(c).lower() or 'выработки' in str(c).lower()][0]
-        name_col = [c for c in df.columns if 'наименование продукции' in str(c).lower()][0]
-        qty_col = [c for c in df.columns if 'объём' in str(c).lower()][0]
+        # Читаем Excel (без пропуска строк — если заголовки на первой строке)
+        df = pd.read_excel(uploaded_file)
+
+        # Поиск колонок по точному имени
+        def find_col_by_name(df, target_names):
+            for col in df.columns:
+                col_clean = str(col).strip().lower()
+                for target in target_names:
+                    if col_clean == target.lower():
+                        return col
+            return None
+
+        date_col = find_col_by_name(df, ['Дата выработки'])
+        name_col = find_col_by_name(df, ['Наименование продукции'])
+        qty_col = find_col_by_name(df, ['Объём'])
+
+        if not all([date_col, name_col, qty_col]):
+            st.error("❌ Не найдены обязательные колонки: 'Дата выработки', 'Наименование продукции', 'Объём'.")
+            st.write("Доступные колонки:", list(df.columns))
+            return
 
         conn = get_db_connection()
         cur = conn.cursor()
@@ -64,59 +44,6 @@ if uploaded_file:
         cur.close()
         conn.close()
         st.success("✅ Файл обработан и данные сохранены.")
+
     except Exception as e:
-        st.error(f"Ошибка: {str(e)}")
-
-# === ОТЧЁТ ПО ДАТЕ ===
-st.subheader("Отчёт по дате выработки")
-selected_date = st.date_input("Выберите дату", value=date.today())
-
-conn = get_db_connection()
-cur = conn.cursor()
-
-cur.execute("""
-    SELECT fg.id, p.mercurius_name, fg.quantity_kg, p.package_weight_kg
-    FROM finished_goods fg
-    JOIN products p ON fg.product_id = p.id
-    WHERE fg.production_date = %s
-    ORDER BY p.mercurius_name
-""", (selected_date,))
-releases = cur.fetchall()
-
-if releases:
-    for fg_id, name, kg, pkg_kg in releases:
-        pieces = kg / pkg_kg
-        st.markdown(f"### {name}")
-        st.write(f"**Объём:** {kg} кг | **Штук:** {pieces:.0f}")
-
-        # Списания (включая воду — для отображения)
-        cur.execute("""
-            SELECT c.name, w.quantity
-            FROM write_offs w
-            JOIN components c ON w.component_id = c.id
-            WHERE w.finished_good_id = %s
-            ORDER BY c.name
-        """, (fg_id,))
-        write_offs = cur.fetchall()
-
-        # Добавляем воду из рецептуры (только для отображения!)
-        cur.execute("""
-            SELECT 'Вода', ri.quantity_per_kg * %s
-            FROM recipe_items ri
-            JOIN components c ON ri.component_id = c.id
-            JOIN products p ON ri.recipe_id = p.recipe_id
-            WHERE p.id = (
-                SELECT product_id FROM finished_goods WHERE id = %s
-            ) AND c.name = 'Вода'
-        """, (kg, fg_id))
-        water = cur.fetchone()
-        if water:
-            write_offs.append(water)
-
-        for comp_name, qty in write_offs:
-            st.write(f"- {comp_name}: {qty:.4f} кг")
-else:
-    st.info("Нет данных за выбранную дату.")
-
-cur.close()
-conn.close()
+        st.error(f"Ошибка при обработке файла: {str(e)}")
