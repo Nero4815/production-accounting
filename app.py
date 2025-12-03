@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import psycopg2
 from datetime import datetime, date
+from collections import defaultdict
 
 DB_CONFIG = {
     "host": "db",
@@ -29,7 +30,6 @@ if not st.session_state.authenticated:
                 st.error("Неверный пароль")
     st.stop()
 
-# === Основной UI ===
 st.title("🐟 Система прослеживаемости производства")
 
 # === Импорт Excel ===
@@ -38,10 +38,8 @@ uploaded_file = st.file_uploader("Загрузите Excel-файл", type=["xls
 
 if uploaded_file:
     try:
-        # Читаем все листы (по умолчанию первый)
         df = pd.read_excel(uploaded_file)
 
-        # Функция поиска колонки по точному имени (без учёта регистра и пробелов)
         def find_col(cols, expected):
             for col in cols:
                 if str(col).strip().lower() == expected.lower():
@@ -53,20 +51,21 @@ if uploaded_file:
         qty_col = find_col(df.columns, "Объём")
 
         if not all([date_col, name_col, qty_col]):
-            st.error("❌ Не найдены обязательные колонки: 'Дата выработки', 'Наименование продукции', 'Объём'")
+            st.error("❌ Не найдены обязательные колонки")
             st.write("Доступные колонки:", list(df.columns))
         else:
             conn = get_db_connection()
             cur = conn.cursor()
+            not_found = []
 
-            processed = 0
             for _, row in df.iterrows():
                 full_name = str(row[name_col]).strip()
                 qty_kg = float(row[qty_col])
-                # Обработка даты в формате "06.11.2025:00"
+                
+                # Обработка даты: "06.11.2025:00" → "06.11.2025"
                 date_str = str(row[date_col]).strip()
                 if ':' in date_str and '.' in date_str:
-                    date_part = date_str.split(':')[0]  # Берём только "06.11.2025"
+                    date_part = date_str.split(':')[0]
                     prod_date = pd.to_datetime(date_part, format='%d.%m.%Y').date()
                 else:
                     prod_date = pd.to_datetime(row[date_col]).date()
@@ -74,22 +73,26 @@ if uploaded_file:
                 cur.execute("SELECT id FROM products WHERE mercurius_name = %s", (full_name,))
                 prod = cur.fetchone()
                 if not prod:
-                    st.warning(f"Продукт не найден: {full_name}")
+                    not_found.append(full_name)
                     continue
 
                 cur.execute("""
                     INSERT INTO finished_goods (production_date, product_id, quantity_kg)
                     VALUES (%s, %s, %s)
                 """, (prod_date, prod[0], qty_kg))
-                processed += 1
 
             conn.commit()
             cur.close()
             conn.close()
-            st.success(f"✅ Успешно обработано записей: {processed}")
+
+            st.success(f"✅ Успешно обработано записей.")
+            if not_found:
+                with st.expander(f"⚠️ {len(not_found)} продуктов не найдено в справочнике"):
+                    for name in not_found:
+                        st.write(f"- {name}")
 
     except Exception as e:
-        st.error(f"Ошибка при обработке файла: {str(e)}")
+        st.error(f"Ошибка: {str(e)}")
 
 # === Отчёт по дате ===
 st.subheader("📅 Отчёт по дате выработки")
@@ -108,12 +111,14 @@ cur.execute("""
 releases = cur.fetchall()
 
 if releases:
-    for fg_id, name, kg, pkg_kg in releases:
-        pieces = kg / pkg_kg
-        st.markdown(f"### {name}")
-        st.write(f"**Объём:** {kg} кг | **Штук:** {pieces:.0f}")
+    st.subheader(f"Выпуск за {selected_date.strftime('%d.%m.%Y')}")
+    grouped = defaultdict(lambda: {"kg": 0, "pieces": 0, "write_offs": []})
 
-        # Списанные компоненты (реальные списания)
+    for fg_id, name, kg, pkg_kg in releases:
+        grouped[name]["kg"] += kg
+        grouped[name]["pieces"] += kg / pkg_kg
+
+        # Списания
         cur.execute("""
             SELECT c.name, w.quantity
             FROM write_offs w
@@ -121,9 +126,18 @@ if releases:
             WHERE w.finished_good_id = %s
             ORDER BY c.name
         """, (fg_id,))
-        write_offs = cur.fetchall()
+        for comp, qty in cur.fetchall():
+            # Суммируем по компоненту
+            found = False
+            for i, (c, q) in enumerate(grouped[name]["write_offs"]):
+                if c == comp:
+                    grouped[name]["write_offs"][i] = (c, q + qty)
+                    found = True
+                    break
+            if not found:
+                grouped[name]["write_offs"].append((comp, qty))
 
-        # Добавляем воду из рецептуры (только для отображения!)
+        # Вода (для отображения)
         cur.execute("""
             SELECT 'Вода', ri.quantity_per_kg * %s
             FROM recipe_items ri
@@ -133,12 +147,24 @@ if releases:
                 SELECT product_id FROM finished_goods WHERE id = %s
             ) AND c.name = 'Вода'
         """, (kg, fg_id))
-        water_row = cur.fetchone()
-        if water_row:
-            write_offs.append(water_row)
+        water = cur.fetchone()
+        if water:
+            comp, qty = water
+            found = False
+            for i, (c, q) in enumerate(grouped[name]["write_offs"]):
+                if c == comp:
+                    grouped[name]["write_offs"][i] = (c, q + qty)
+                    found = True
+                    break
+            if not found:
+                grouped[name]["write_offs"].append((comp, qty))
 
-        for comp_name, qty in write_offs:
-            st.write(f"- {comp_name}: {qty:.4f} кг")
+    for name, data in grouped.items():
+        st.markdown(f"### {name}")
+        st.write(f"**Объём:** {data['kg']:.3f} кг | **Штук:** {data['pieces']:.0f}")
+        for comp, qty in data["write_offs"]:
+            st.write(f"- {comp}: {qty:.4f} кг")
+        st.markdown("---")
 else:
     st.info("Нет данных за выбранную дату.")
 
