@@ -8,8 +8,8 @@ services:
       POSTGRES_USER: nero
       POSTGRES_PASSWORD: secure_password_123
     volumes:
-      - pg:/var/lib/postgresql/data    
-      - ./backups:/backups             
+      - pg:/var/lib/postgresql/data
+      - ./backups:/backups
     networks:
       - prodnet
 
@@ -24,7 +24,7 @@ services:
       - prodnet
 
 volumes:
-  pg:  
+  pg: {}
 
 networks:
-  prodnet:
+  prodnet: {}
