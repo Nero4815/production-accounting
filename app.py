@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import psycopg2
 from datetime import date
-import re
 
 # Настройки подключения к БД
 DB_CONFIG = {
@@ -57,31 +56,40 @@ if uploaded_file:
             st.error("❌ Не найдены обязательные колонки: 'Дата выработки', 'Наименование продукции', 'Объём'")
             st.write("Доступные колонки:", list(df.columns))
         else:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            not_found = []
+            # Парсим все строки и собираем даты
+            dates_to_clear = set()
+            parsed_rows = []
 
             for _, row in df.iterrows():
-                full_name = str(row[name_col]).strip()
-                qty_kg = float(row[qty_col])
-                
                 # Обработка даты: "06.11.2025:00" → "06.11.2025"
                 date_str = str(row[date_col]).strip()
                 if ':' in date_str:
                     date_part = date_str.split(':')[0].strip()
                 else:
                     date_part = date_str.strip()
-                # Парсинг строго по формату DD.MM.YYYY
                 prod_date = pd.to_datetime(date_part, format='%d.%m.%Y').date()
+                dates_to_clear.add(prod_date)
 
-                # Поиск продукта
+                full_name = str(row[name_col]).strip()
+                qty_kg = float(row[qty_col])
+                parsed_rows.append((prod_date, full_name, qty_kg))
+
+            conn = get_db_connection()
+            cur = conn.cursor()
+
+            # 🔥 ОЧИСТКА: удаляем ВСЕ выпуски за даты, присутствующие в файле
+            for d in dates_to_clear:
+                cur.execute("DELETE FROM finished_goods WHERE production_date = %s", (d,))
+
+            # Вставка новых данных
+            not_found = []
+            for prod_date, full_name, qty_kg in parsed_rows:
                 cur.execute("SELECT id FROM products WHERE mercurius_name = %s", (full_name,))
                 prod = cur.fetchone()
                 if not prod:
                     not_found.append(full_name)
                     continue
 
-                # Вставка выпуска → триггер автоматически спишет сырьё
                 cur.execute("""
                     INSERT INTO finished_goods (production_date, product_id, quantity_kg)
                     VALUES (%s, %s, %s)
@@ -91,7 +99,8 @@ if uploaded_file:
             cur.close()
             conn.close()
 
-            st.success(f"✅ Успешно обработано записей: {len(df) - len(not_found)}")
+            total_ok = len(parsed_rows) - len(not_found)
+            st.success(f"✅ Успешно обработано записей: {total_ok}")
             if not_found:
                 with st.expander(f"⚠️ {len(not_found)} продуктов не найдено в справочнике"):
                     for name in not_found:
@@ -107,7 +116,8 @@ selected_date = st.date_input("Выберите дату", value=date.today())
 conn = get_db_connection()
 cur = conn.cursor()
 
-# Агрегированный запрос: одна строка на продукт
+# Получаем выпуск за день (без агрегации — одна строка = одна запись)
+# Но для отчёта объединим по наименованию
 cur.execute("""
     SELECT 
         p.mercurius_name,
@@ -129,37 +139,20 @@ if releases:
         st.markdown(f"### {name}")
         st.write(f"**Объём:** {total_kg:.3f} кг | **Штук:** {int(pieces)}")
 
-        # Суммарные списания по компонентам для всех записей этого продукта за дату
+        # Списанные компоненты: считаем по рецептуре (надёжнее, чем триггер)
         cur.execute("""
-            SELECT c.name, SUM(w.quantity) AS total_qty
-            FROM finished_goods fg
-            JOIN write_offs w ON w.finished_good_id = fg.id
-            JOIN components c ON w.component_id = c.id
-            WHERE fg.product_id = %s AND fg.production_date = %s
-            GROUP BY c.id, c.name
-            ORDER BY c.name
-        """, (product_id, selected_date))
-        write_offs = cur.fetchall()
-
-        # Получаем воду из рецептуры (если есть)
-        cur.execute("""
-            SELECT ri.quantity_per_kg * %s
+            SELECT 
+                c.name,
+                SUM(ri.quantity_per_kg * %s) AS total_qty
             FROM recipe_items ri
             JOIN components c ON ri.component_id = c.id
             WHERE ri.recipe_id = (SELECT recipe_id FROM products WHERE id = %s)
-              AND c.name = 'Вода'
+            GROUP BY c.id, c.name
+            ORDER BY c.name
         """, (total_kg, product_id))
-        water_row = cur.fetchone()
-        water_qty = water_row[0] if water_row else 0
+        components = cur.fetchall()
 
-        # Объединяем списания и воду
-        comp_dict = {name: qty for name, qty in write_offs}
-        if water_qty > 0:
-            comp_dict['Вода'] = comp_dict.get('Вода', 0) + water_qty
-
-        # Вывод компонентов
-        for comp_name in sorted(comp_dict.keys()):
-            qty = comp_dict[comp_name]
+        for comp_name, qty in components:
             st.write(f"- {comp_name}: {qty:.4f} кг")
         st.markdown("---")
 else:
