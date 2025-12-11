@@ -107,48 +107,59 @@ selected_date = st.date_input("Выберите дату", value=date.today())
 conn = get_db_connection()
 cur = conn.cursor()
 
-# Получаем выпуск за день
+# Агрегированный запрос: одна строка на продукт
 cur.execute("""
-    SELECT fg.id, p.mercurius_name, fg.quantity_kg, p.package_weight_kg
+    SELECT 
+        p.mercurius_name,
+        SUM(fg.quantity_kg) AS total_kg,
+        p.package_weight_kg,
+        p.id AS product_id
     FROM finished_goods fg
     JOIN products p ON fg.product_id = p.id
     WHERE fg.production_date = %s
+    GROUP BY p.id, p.mercurius_name, p.package_weight_kg
     ORDER BY p.mercurius_name
 """, (selected_date,))
 releases = cur.fetchall()
 
 if releases:
     st.subheader(f"Выпуск за {selected_date.strftime('%d.%m.%Y')}")
-    for fg_id, name, kg, pkg_kg in releases:
-        pieces = kg / pkg_kg if pkg_kg > 0 else 0
+    for name, total_kg, pkg_kg, product_id in releases:
+        pieces = total_kg / pkg_kg if pkg_kg > 0 else 0
         st.markdown(f"### {name}")
-        st.write(f"**Объём:** {kg} кг | **Штук:** {int(pieces)}")
+        st.write(f"**Объём:** {total_kg:.3f} кг | **Штук:** {int(pieces)}")
 
-        # Списанные компоненты (реальные списания)
+        # Суммарные списания по компонентам для всех записей этого продукта за дату
         cur.execute("""
-            SELECT c.name, w.quantity
-            FROM write_offs w
+            SELECT c.name, SUM(w.quantity) AS total_qty
+            FROM finished_goods fg
+            JOIN write_offs w ON w.finished_good_id = fg.id
             JOIN components c ON w.component_id = c.id
-            WHERE w.finished_good_id = %s
+            WHERE fg.product_id = %s AND fg.production_date = %s
+            GROUP BY c.id, c.name
             ORDER BY c.name
-        """, (fg_id,))
+        """, (product_id, selected_date))
         write_offs = cur.fetchall()
 
-        # Добавляем воду из рецептуры (только для отображения)
+        # Получаем воду из рецептуры (если есть)
         cur.execute("""
-            SELECT 'Вода', ri.quantity_per_kg * %s
+            SELECT ri.quantity_per_kg * %s
             FROM recipe_items ri
             JOIN components c ON ri.component_id = c.id
-            JOIN products p ON ri.recipe_id = p.recipe_id
-            WHERE p.id = (
-                SELECT product_id FROM finished_goods WHERE id = %s
-            ) AND c.name = 'Вода'
-        """, (kg, fg_id))
-        water = cur.fetchone()
-        if water and water[1] > 0:
-            write_offs.append(water)
+            WHERE ri.recipe_id = (SELECT recipe_id FROM products WHERE id = %s)
+              AND c.name = 'Вода'
+        """, (total_kg, product_id))
+        water_row = cur.fetchone()
+        water_qty = water_row[0] if water_row else 0
 
-        for comp_name, qty in write_offs:
+        # Объединяем списания и воду
+        comp_dict = {name: qty for name, qty in write_offs}
+        if water_qty > 0:
+            comp_dict['Вода'] = comp_dict.get('Вода', 0) + water_qty
+
+        # Вывод компонентов
+        for comp_name in sorted(comp_dict.keys()):
+            qty = comp_dict[comp_name]
             st.write(f"- {comp_name}: {qty:.4f} кг")
         st.markdown("---")
 else:
