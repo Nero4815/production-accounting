@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import psycopg2
 from datetime import date
+from collections import defaultdict
 
 # Настройки подключения к БД
 DB_CONFIG = {
@@ -13,6 +14,25 @@ DB_CONFIG = {
 
 def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)
+
+# === ОПРЕДЕЛЕНИЕ РЕЦЕПТУРНОЙ ГРУППЫ ПО НАИМЕНОВАНИЮ ===
+def classify_recipe_group(name: str) -> str:
+    n = name.lower().strip()
+    
+    # Группа "Копчёнка": холодное копчение
+    if 'х/к' in n or 'холодного копчения' in n:
+        return "Копчёнка"
+    
+    # Группа "Дикси": бренды и маркировки
+    dixie_keywords = [
+        'nord fjord', 'magellan', 'spar', 'мореслав', 'красная цена',
+        'fish house', 'кд/', 'кп/', 'пр!ст'
+    ]
+    if any(kw in n for kw in dixie_keywords):
+        return "Дикси"
+    
+    # Остальное — "Регионы"
+    return "Регионы"
 
 # Аутентификация
 if "authenticated" not in st.session_state:
@@ -40,14 +60,11 @@ if uploaded_file:
     with st.spinner("Обработка файла..."):
         try:
             df = pd.read_excel(uploaded_file)
-
-            # Удаляем полностью пустые строки
             df = df.dropna(how='all')
             if df.empty:
                 st.warning("Файл не содержит данных.")
                 st.stop()
 
-            # Поиск колонок по точному совпадению
             def find_col(cols, target):
                 target_clean = target.strip().lower()
                 for col in cols:
@@ -64,32 +81,27 @@ if uploaded_file:
                 st.write("Доступные колонки:", list(df.columns))
                 st.stop()
 
-            # Парсим строки, пропуская некорректные
             dates_to_clear = set()
             parsed_rows = []
             row_errors = []
 
             for idx, row in df.iterrows():
                 try:
-                    # Пропускаем строки, где нет ни наименования, ни объёма
                     name_val = row[name_col]
                     qty_val = row[qty_col]
                     if pd.isna(name_val) and pd.isna(qty_val):
                         continue
 
-                    # Наименование
                     full_name = str(name_val).strip() if pd.notna(name_val) else ""
                     if not full_name:
                         raise ValueError("Пустое наименование")
 
-                    # Объём
                     if pd.isna(qty_val):
                         raise ValueError("Отсутствует объём")
                     qty_kg = float(qty_val)
                     if qty_kg <= 0:
                         raise ValueError("Объём должен быть > 0")
 
-                    # Дата
                     date_val = row[date_col]
                     if pd.isna(date_val):
                         raise ValueError("Отсутствует дата")
@@ -116,13 +128,12 @@ if uploaded_file:
                 st.error("Нет корректных данных для импорта.")
                 st.stop()
 
-            # Работа с БД
             conn = None
             try:
                 conn = get_db_connection()
                 cur = conn.cursor()
 
-                # 🔥 Очистка: сначала write_offs, потом finished_goods
+                # Очистка связанных данных
                 for d in dates_to_clear:
                     cur.execute("""
                         DELETE FROM write_offs
@@ -132,7 +143,7 @@ if uploaded_file:
                     """, (d,))
                     cur.execute("DELETE FROM finished_goods WHERE production_date = %s", (d,))
 
-                # Вставка новых записей
+                # Вставка новых данных
                 not_found = []
                 for prod_date, full_name, qty_kg in parsed_rows:
                     cur.execute("SELECT id FROM products WHERE mercurius_name = %s", (full_name,))
@@ -159,9 +170,8 @@ if uploaded_file:
 
         except Exception as e:
             st.error(f"❌ Ошибка при обработке файла: {str(e)}")
-            # st.exception(e)  # раскомментируйте для отладки
 
-# === ОТЧЁТ ПО ДАТЕ ===
+# === ОТЧЁТ ПО ДАТЕ С ГРУППИРОВКОЙ ПО РЕЦЕПТУРАМ ===
 st.subheader("📅 Отчёт по дате выработки")
 selected_date = st.date_input("Выберите дату", value=date.today())
 
@@ -185,27 +195,52 @@ try:
 
     if releases:
         st.subheader(f"Выпуск за {selected_date.strftime('%d.%m.%Y')}")
+
+        # Группируем по рецептуре
+        grouped = defaultdict(list)
         for name, total_kg, pkg_kg, product_id in releases:
-            pieces = total_kg / pkg_kg if pkg_kg > 0 else 0
-            st.markdown(f"### {name}")
-            st.write(f"**Объём:** {total_kg:.3f} кг | **Штук:** {int(pieces)}")
+            group = classify_recipe_group(name)
+            grouped[group].append((name, total_kg, pkg_kg, product_id))
 
-            # Расчёт компонентов по рецептуре
-            cur.execute("""
-                SELECT 
-                    c.name,
-                    SUM(ri.quantity_per_kg * %s) AS total_qty
-                FROM recipe_items ri
-                JOIN components c ON ri.component_id = c.id
-                WHERE ri.recipe_id = (SELECT recipe_id FROM products WHERE id = %s)
-                GROUP BY c.id, c.name
-                ORDER BY c.name
-            """, (total_kg, product_id))
-            components = cur.fetchall()
+        # Вывод в фиксированном порядке
+        for group_name in ["Регионы", "Дикси", "Копчёнка"]:
+            if group_name in grouped:
+                st.markdown(f"#### 📌 {group_name}")
+                for name, total_kg, pkg_kg, product_id in grouped[group_name]:
+                    pieces = total_kg / pkg_kg if pkg_kg > 0 else 0
+                    st.markdown(f"**{name}**")
+                    st.write(f"Объём: {total_kg:.3f} кг | Штук: {int(pieces)}")
 
-            for comp_name, qty in components:
-                st.write(f"- {comp_name}: {qty:.4f} кг")
-            st.markdown("---")
+                    # Расчёт по группе
+                    if group_name == "Регионы":
+                        components = [
+                            ("Вода", total_kg * (0.7375 + 0.89746)),
+                            ("Соль", total_kg * (0.24 + 0.10)),
+                            ("Фиш PN", total_kg * (0.01 + 0.0025)),
+                            ("Консерв \"Специальный\"", total_kg * 0.002),
+                            ("Краситель", total_kg * (0.0005 + 0.00004)),
+                            ("Бактостоп", total_kg * 0.01),
+                        ]
+                    elif group_name == "Дикси":
+                        components = [
+                            ("Вода", total_kg * (0.758 + 0.8995)),
+                            ("Соль", total_kg * (0.24 + 0.14)),
+                            ("Консерв \"Специальный\"", total_kg * (0.002 + 0.0005)),
+                        ]
+                    elif group_name == "Копчёнка":
+                        components = [
+                            ("Вода", total_kg * (0.80 + 0.8575)),
+                            ("Соль", total_kg * (0.19 + 0.14)),
+                            ("Бактостоп", total_kg * (0.01 + 0.0025)),
+                        ]
+                    else:
+                        components = []
+
+                    # Вывод ненулевых компонентов
+                    for comp_name, qty in components:
+                        if qty > 0.0001:  # избегаем 0.0000
+                            st.write(f"- {comp_name}: {qty:.4f} кг")
+                    st.markdown("---")
     else:
         st.info("Нет данных за выбранную дату.")
 
