@@ -128,14 +128,16 @@ if uploaded_file:
                 conn = get_db_connection()
                 cur = conn.cursor()
 
-                # Очистка старых данных за даты из файла
+                # 🔥 ИСПРАВЛЕНО: сначала удаляем write_offs, потом finished_goods
                 for d in dates_to_clear:
+                    # Удаляем связанные списания
                     cur.execute("""
-                        DELETE FROM write_offs
+                        DELETE FROM write_offs 
                         WHERE finished_good_id IN (
                             SELECT id FROM finished_goods WHERE production_date = %s
                         )
                     """, (d,))
+                    # Теперь удаляем выпуск
                     cur.execute("DELETE FROM finished_goods WHERE production_date = %s", (d,))
 
                 # Вставка новых данных
@@ -174,6 +176,7 @@ try:
     conn = get_db_connection()
     cur = conn.cursor()
 
+    # Получаем данные с привязкой к рецептуре из БД
     cur.execute("""
         SELECT 
             p.mercurius_name,
@@ -193,7 +196,6 @@ try:
     if releases:
         st.subheader(f"Выпуск за {selected_date.strftime('%d.%m.%Y')}")
 
-        # Группируем по рецептуре (используем recipe_name из БД)
         grouped = defaultdict(list)
         recipe_totals = defaultdict(float)
 
@@ -222,7 +224,7 @@ try:
                     })
                 st.table(table_data)
 
-                # === Суммарные компоненты по нормам из recipe_items ===
+                # Суммарные компоненты по нормам из recipe_items
                 cur.execute("""
                     SELECT 
                         c.name,
@@ -242,8 +244,6 @@ try:
                     for comp_name, qty in components:
                         qty = float(qty) if isinstance(qty, Decimal) else qty
                         if qty > 0.0001:
-                            # Исключаем "Вода", если не нужно (по вашему триггеру она не списывается)
-                            # Но оставим, так как вы хотите видеть в отчёте
                             comp_table.append({
                                 "Компонент": comp_name,
                                 "Количество (кг)": f"{qty:.4f}"
