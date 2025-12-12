@@ -16,6 +16,7 @@ DB_CONFIG = {
 def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)
 
+# === ОПРЕДЕЛЕНИЕ РЕЦЕПТУРНОЙ ГРУППЫ ПО НАИМЕНОВАНИЮ ===
 def classify_recipe_group(name: str) -> str:
     n = name.lower().strip()
     if 'х/к' in n or 'холодного копчения' in n:
@@ -127,6 +128,7 @@ if uploaded_file:
                 conn = get_db_connection()
                 cur = conn.cursor()
 
+                # Очистка старых данных за даты из файла
                 for d in dates_to_clear:
                     cur.execute("""
                         DELETE FROM write_offs
@@ -136,6 +138,7 @@ if uploaded_file:
                     """, (d,))
                     cur.execute("DELETE FROM finished_goods WHERE production_date = %s", (d,))
 
+                # Вставка новых данных
                 not_found = []
                 for prod_date, full_name, qty_kg in parsed_rows:
                     cur.execute("SELECT id FROM products WHERE mercurius_name = %s", (full_name,))
@@ -163,7 +166,7 @@ if uploaded_file:
         except Exception as e:
             st.error(f"❌ Ошибка при обработке файла: {str(e)}")
 
-# === ОТЧЁТ ПО ДАТЕ С КОРРЕКТНЫМИ НОРМАМИ ===
+# === ОТЧЁТ ПО ДАТЕ ===
 st.subheader("📅 Отчёт по дате выработки")
 selected_date = st.date_input("Выберите дату", value=date.today())
 
@@ -176,56 +179,35 @@ try:
             p.mercurius_name,
             SUM(fg.quantity_kg) AS total_kg,
             p.package_weight_kg,
-            p.id AS product_id
+            p.id AS product_id,
+            r.name AS recipe_name
         FROM finished_goods fg
         JOIN products p ON fg.product_id = p.id
+        JOIN recipes r ON p.recipe_id = r.id
         WHERE fg.production_date = %s
-        GROUP BY p.id, p.mercurius_name, p.package_weight_kg
-        ORDER BY p.mercurius_name
+        GROUP BY p.id, p.mercurius_name, p.package_weight_kg, r.name
+        ORDER BY r.name, p.mercurius_name
     """, (selected_date,))
     releases = cur.fetchall()
 
     if releases:
         st.subheader(f"Выпуск за {selected_date.strftime('%d.%m.%Y')}")
 
+        # Группируем по рецептуре (используем recipe_name из БД)
         grouped = defaultdict(list)
-        group_totals = {"Регионы": 0.0, "Дикси": 0.0, "Копчёнка": 0.0}
+        recipe_totals = defaultdict(float)
 
-        for name, total_kg, pkg_kg, product_id in releases:
+        for name, total_kg, pkg_kg, product_id, recipe_name in releases:
             total_kg = float(total_kg) if isinstance(total_kg, Decimal) else float(total_kg)
             pkg_kg = float(pkg_kg) if isinstance(pkg_kg, Decimal) else float(pkg_kg)
-            group = classify_recipe_group(name)
-            grouped[group].append((name, total_kg, pkg_kg))
-            group_totals[group] += total_kg
+            grouped[recipe_name].append((name, total_kg, pkg_kg))
+            recipe_totals[recipe_name] += total_kg
 
-        # === Коэффициенты на 1 кг готового продукта ===
-        # Рассчитаны из ваших эталонных данных
-        norms = {
-            "Регионы": {
-                "Охлаждённая форель": 2010 / 1884,
-                "Вода": 1913.47 / 1884,
-                "Соль": 260.79 / 1884,
-                "Фиш PN": 7.73 / 1884,
-                "Консерв \"Специальный\"": 0.6 / 1884,
-                "Краситель": 0.23 / 1884,
-                "Бактостоп": 3.01 / 1884,
-            },
-            "Дикси": {
-                "Охлаждённая форель": 3434 / 3150,
-                "Вода": 3046.01 / 3150,
-                "Соль": 548.17 / 3150,
-                "Консерв \"Специальный\"": 2.4678 / 3150,
-            },
-            "Копчёнка": {
-                "Охлаждённая форель": 15 / 14,
-                "Вода": 14.25 / 14,
-                "Соль": 2.45 / 14,
-                "Бактостоп": 0.05904 / 14,
-            }
-        }
+        # Порядок групп
+        group_order = ["Регионы", "Дикси", "Копчёнка"]
 
-        for group_name in ["Регионы", "Дикси", "Копчёнка"]:
-            total_kg_group = group_totals[group_name]
+        for group_name in group_order:
+            total_kg_group = recipe_totals[group_name]
             if group_name in grouped and total_kg_group > 0:
                 st.markdown(f"#### 📌 {group_name}")
 
@@ -240,22 +222,36 @@ try:
                     })
                 st.table(table_data)
 
-                # Суммарные компоненты по нормам
-                st.markdown("**Суммарные компоненты по рецептуре:**")
-
-                components = []
-                for comp_name, coef in norms.get(group_name, {}).items():
-                    qty = total_kg_group * coef
-                    if qty > 0.0001:
-                        components.append({
-                            "Компонент": comp_name,
-                            "Количество (кг)": f"{qty:.4f}"
-                        })
+                # === Суммарные компоненты по нормам из recipe_items ===
+                cur.execute("""
+                    SELECT 
+                        c.name,
+                        SUM(ri.quantity_per_kg * %s) AS total_qty
+                    FROM recipe_items ri
+                    JOIN components c ON ri.component_id = c.id
+                    JOIN recipes r ON ri.recipe_id = r.id
+                    WHERE r.name = %s
+                    GROUP BY c.id, c.name
+                    ORDER BY c.name
+                """, (total_kg_group, group_name))
+                components = cur.fetchall()
 
                 if components:
-                    st.table(components)
+                    st.markdown("**Суммарные компоненты по рецептуре:**")
+                    comp_table = []
+                    for comp_name, qty in components:
+                        qty = float(qty) if isinstance(qty, Decimal) else qty
+                        if qty > 0.0001:
+                            # Исключаем "Вода", если не нужно (по вашему триггеру она не списывается)
+                            # Но оставим, так как вы хотите видеть в отчёте
+                            comp_table.append({
+                                "Компонент": comp_name,
+                                "Количество (кг)": f"{qty:.4f}"
+                            })
+                    if comp_table:
+                        st.table(comp_table)
                 else:
-                    st.write("Нет компонентов для отображения.")
+                    st.write("Нет данных о компонентах.")
 
                 st.markdown("---")
     else:
