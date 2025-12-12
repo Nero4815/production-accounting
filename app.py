@@ -19,17 +19,14 @@ def get_db_connection():
 # === ОПРЕДЕЛЕНИЕ РЕЦЕПТУРНОЙ ГРУППЫ ПО НАИМЕНОВАНИЮ ===
 def classify_recipe_group(name: str) -> str:
     n = name.lower().strip()
-    # Группа "Копчёнка"
     if 'х/к' in n or 'холодного копчения' in n:
         return "Копчёнка"
-    # Группа "Дикси"
     dixie_keywords = [
         'nord fjord', 'magellan', 'spar', 'мореслав', 'красная цена',
         'fish house', 'кд/', 'кп/', 'пр!ст'
     ]
     if any(kw in n for kw in dixie_keywords):
         return "Дикси"
-    # Остальное — "Регионы"
     return "Регионы"
 
 # Аутентификация
@@ -131,7 +128,6 @@ if uploaded_file:
                 conn = get_db_connection()
                 cur = conn.cursor()
 
-                # Удаляем сначала write_offs, потом finished_goods
                 for d in dates_to_clear:
                     cur.execute("""
                         DELETE FROM write_offs
@@ -141,7 +137,6 @@ if uploaded_file:
                     """, (d,))
                     cur.execute("DELETE FROM finished_goods WHERE production_date = %s", (d,))
 
-                # Вставка новых данных
                 not_found = []
                 for prod_date, full_name, qty_kg in parsed_rows:
                     cur.execute("SELECT id FROM products WHERE mercurius_name = %s", (full_name,))
@@ -194,7 +189,6 @@ try:
     if releases:
         st.subheader(f"Выпуск за {selected_date.strftime('%d.%m.%Y')}")
 
-        # Группировка и агрегация
         grouped = defaultdict(list)
         group_totals = {"Регионы": 0.0, "Дикси": 0.0, "Копчёнка": 0.0}
 
@@ -205,7 +199,6 @@ try:
             grouped[group].append((name, total_kg, pkg_kg))
             group_totals[group] += total_kg
 
-        # Вывод по группам
         for group_name in ["Регионы", "Дикси", "Копчёнка"]:
             total_kg_group = group_totals[group_name]
             if group_name in grouped and total_kg_group > 0:
@@ -222,11 +215,15 @@ try:
                     })
                 st.table(table_data)
 
-                # Суммарные компоненты по группе
+                # === Суммарные компоненты с охлаждённой форелью ===
                 st.markdown("**Суммарные компоненты по рецептуре:**")
+
+                # Расчёт охлаждённой форели (сырья)
+                chilled_fish = total_kg_group * 1.27
 
                 if group_name == "Регионы":
                     components = [
+                        ("Охлаждённая форель", chilled_fish),
                         ("Вода", total_kg_group * (0.7375 + 0.89746)),
                         ("Соль", total_kg_group * (0.24 + 0.10)),
                         ("Фиш PN", total_kg_group * (0.01 + 0.0025)),
@@ -236,12 +233,14 @@ try:
                     ]
                 elif group_name == "Дикси":
                     components = [
+                        ("Охлаждённая форель", chilled_fish),
                         ("Вода", total_kg_group * (0.758 + 0.8995)),
                         ("Соль", total_kg_group * (0.24 + 0.14)),
                         ("Консерв \"Специальный\"", total_kg_group * (0.002 + 0.0005)),
                     ]
                 elif group_name == "Копчёнка":
                     components = [
+                        ("Охлаждённая форель", chilled_fish),
                         ("Вода", total_kg_group * (0.80 + 0.8575)),
                         ("Соль", total_kg_group * (0.19 + 0.14)),
                         ("Бактостоп", total_kg_group * (0.01 + 0.0025)),
@@ -249,7 +248,6 @@ try:
                 else:
                     components = []
 
-                # Таблица компонентов
                 comp_table = []
                 for comp_name, qty in components:
                     if qty > 0.0001:
